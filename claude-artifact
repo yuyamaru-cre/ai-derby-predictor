@@ -36,6 +36,159 @@ export default function HorseRacingApp() {
   ];
 
   // ストレージ操作のヘルパー関数（フォールバック付き）
+  // --- Google Drive adapter ---
+  const getDriveConfig = () => {
+    try {
+      const cfg = window.googleDriveStorage
+      if (cfg && typeof cfg.folderId === 'string' && cfg.folderId) return cfg
+    } catch (_) {}
+    return null
+  }
+
+  const getDriveAccessToken = async () => {
+    const cfg = getDriveConfig()
+    if (!cfg) return null
+    if (typeof cfg.getAccessToken === 'function') {
+      try {
+        const t = await cfg.getAccessToken()
+        if (typeof t === 'string' && t) return t
+      } catch (_) {}
+    }
+    if (typeof cfg.accessToken === 'string' && cfg.accessToken) return cfg.accessToken
+    return null
+  }
+
+  const base64urlEncode = (str) => {
+    const b64 = btoa(unescape(encodeURIComponent(str)))
+    return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+  }
+
+  const driveFileNameForKey = (key) => `kv__${base64urlEncode(key)}.txt`
+
+  const driveFindFileId = async (key) => {
+    const cfg = getDriveConfig()
+    const token = await getDriveAccessToken()
+    if (!cfg || !token) return null
+    const name = driveFileNameForKey(key)
+    const q = `name='${name}' and '${cfg.folderId}' in parents and trashed=false`
+    const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name)&pageSize=1&supportsAllDrives=true&includeItemsFromAllDrives=true`
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+    if (!res.ok) return null
+    const data = await res.json()
+    const file = Array.isArray(data.files) && data.files[0]
+    return file ? file.id : null
+  }
+
+  const driveGet = async (key) => {
+    try {
+      const fileId = await driveFindFileId(key)
+      const token = await getDriveAccessToken()
+      if (!fileId || !token) return undefined
+      const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+      if (!res.ok) return undefined
+      return await res.text()
+    } catch (_) {
+      return undefined
+    }
+  }
+
+  const driveSet = async (key, value) => {
+    try {
+      const cfg = getDriveConfig()
+      const token = await getDriveAccessToken()
+      if (!cfg || !token) return false
+      const fileId = await driveFindFileId(key)
+      if (fileId) {
+        // update content
+        const url = `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media&supportsAllDrives=true`
+        const res = await fetch(url, {
+          method: 'PATCH',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'text/plain; charset=UTF-8',
+            'Cache-Control': 'no-store'
+          },
+          body: value
+        })
+        return res.ok
+      } else {
+        // create new file via multipart
+        const metadata = {
+          name: driveFileNameForKey(key),
+          parents: [cfg.folderId]
+        }
+        const boundary = `-------kvform${Math.random().toString(36).slice(2)}`
+        const body = [
+          `--${boundary}`,
+          'Content-Type: application/json; charset=UTF-8',
+          '',
+          JSON.stringify(metadata),
+          `--${boundary}`,
+          'Content-Type: text/plain; charset=UTF-8',
+          '',
+          value,
+          `--${boundary}--`,
+          ''
+        ].join('\r\n')
+        const url = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true'
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': `multipart/related; boundary=${boundary}`,
+            'Cache-Control': 'no-store'
+          },
+          body
+        })
+        return res.ok
+      }
+    } catch (_) {
+      return false
+    }
+  }
+
+  const driveDelete = async (key) => {
+    try {
+      const fileId = await driveFindFileId(key)
+      const token = await getDriveAccessToken()
+      if (!fileId || !token) return false
+      const url = `https://www.googleapis.com/drive/v3/files/${fileId}?supportsAllDrives=true`
+      const res = await fetch(url, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } })
+      return res.ok
+    } catch (_) {
+      return false
+    }
+  }
+
+  const driveList = async (prefix) => {
+    try {
+      const cfg = getDriveConfig()
+      const token = await getDriveAccessToken()
+      if (!cfg || !token) return []
+      const baseQ = `'${cfg.folderId}' in parents and name contains 'kv__' and trashed=false`
+      const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(baseQ)}&fields=files(name)&pageSize=1000&supportsAllDrives=true&includeItemsFromAllDrives=true`
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+      if (!res.ok) return []
+      const data = await res.json()
+      const keys = []
+      if (Array.isArray(data.files)) {
+        for (const f of data.files) {
+          const name = f.name || ''
+          if (!name.startsWith('kv__')) continue
+          const enc = name.replace(/^kv__/, '').replace(/\.txt$/, '')
+          try {
+            const b64 = enc.replace(/-/g, '+').replace(/_/g, '/')
+            const decoded = decodeURIComponent(escape(atob(b64)))
+            if (decoded.startsWith(prefix)) keys.push(decoded)
+          } catch (_) {}
+        }
+      }
+      return keys
+    } catch (_) {
+      return []
+    }
+  }
   const getRemoteConfig = () => {
     try {
       const cfg = window.remoteStorage
@@ -114,6 +267,9 @@ export default function HorseRacingApp() {
     }
   }
   const storageGet = async (key) => {
+    // 0) Google Drive 優先
+    const driveVal = await driveGet(key)
+    if (typeof driveVal === 'string') return driveVal
     // 1) remote 優先
     const remoteVal = await remoteGet(key)
     if (typeof remoteVal === 'string') return remoteVal
@@ -136,6 +292,8 @@ export default function HorseRacingApp() {
 
   const storageSet = async (key, value) => {
     let ok = false
+    // Google Drive
+    try { const r = await driveSet(key, value); if (r) ok = true } catch (_) {}
     // localStorage
     try {
       localStorage.setItem(key, value)
@@ -154,21 +312,23 @@ export default function HorseRacingApp() {
       }
     } catch (_) {}
     // remote
-    const r = await remoteSet(key, value)
-    if (r) ok = true
+    try { const r = await remoteSet(key, value); if (r) ok = true } catch (_) {}
     return ok
   };
 
   const storageDelete = async (key) => {
     let ok = false
+    try { if (await driveDelete(key)) ok = true } catch (_) {}
     try { localStorage.removeItem(key); ok = true } catch (_) {}
     try { if (window.storage && typeof window.storage.delete === 'function') { await window.storage.delete(key); ok = true } } catch (_) {}
-    const r = await remoteDelete(key); if (r) ok = true
+    try { const r = await remoteDelete(key); if (r) ok = true } catch (_) {}
     return ok
   };
 
   const storageList = async (prefix) => {
     const merged = new Set()
+    // Google Drive
+    try { (await driveList(prefix)).forEach(k => merged.add(k)) } catch (_) {}
     // localStorage
     try {
       for (let i = 0; i < localStorage.length; i++) {
