@@ -36,94 +36,174 @@ export default function HorseRacingApp() {
   ];
 
   // ストレージ操作のヘルパー関数（フォールバック付き）
-  const storageGet = async (key) => {
+  const getRemoteConfig = () => {
     try {
-      // まずwindow.storageを試す
-      if (window.storage && typeof window.storage.get === 'function') {
-        const result = await window.storage.get(key);
-        return result ? result.value : null;
-      }
-    } catch (error) {
-      console.log('window.storage使用不可、localStorageにフォールバック');
+      const cfg = window.remoteStorage
+      if (cfg && typeof cfg.baseUrl === 'string' && cfg.baseUrl) return cfg
+    } catch (_) {}
+    return null
+  }
+
+  const remoteRequest = async (path, init = {}) => {
+    const cfg = getRemoteConfig()
+    if (!cfg) throw new Error('remote not configured')
+    const url = cfg.baseUrl.replace(/\/$/, '') + path
+    const headers = { 'Content-Type': 'application/json', ...(cfg.headers || {}) }
+    if (cfg.token) headers['Authorization'] = `Bearer ${cfg.token}`
+    const res = await fetch(url, { ...init, headers })
+    if (!res.ok) throw new Error(`remote ${res.status}`)
+    const ct = res.headers.get('content-type') || ''
+    if (ct.includes('application/json')) return await res.json()
+    return await res.text()
+  }
+
+  const remoteGet = async (key) => {
+    try {
+      const cfg = getRemoteConfig()
+      if (!cfg) return undefined
+      const params = new URLSearchParams({ key })
+      if (cfg.user) params.set('user', cfg.user)
+      const data = await remoteRequest(`/get?${params.toString()}`)
+      if (data && typeof data === 'object' && 'value' in data) return data.value
+      if (typeof data === 'string') return data
+      return undefined
+    } catch (_) {
+      return undefined
     }
-    
-    // フォールバック: localStorage
+  }
+
+  const remoteSet = async (key, value) => {
     try {
-      return localStorage.getItem(key);
+      const cfg = getRemoteConfig()
+      if (!cfg) return false
+      const body = { key, value }
+      if (cfg.user) body.user = cfg.user
+      const data = await remoteRequest('/set', { method: 'POST', body: JSON.stringify(body) })
+      if (data && typeof data === 'object' && data.ok) return true
+      return true
+    } catch (_) {
+      return false
+    }
+  }
+
+  const remoteDelete = async (key) => {
+    try {
+      const cfg = getRemoteConfig()
+      if (!cfg) return false
+      const params = new URLSearchParams({ key })
+      if (cfg.user) params.set('user', cfg.user)
+      await remoteRequest(`/delete?${params.toString()}`, { method: 'DELETE' })
+      return true
+    } catch (_) {
+      return false
+    }
+  }
+
+  const remoteList = async (prefix) => {
+    try {
+      const cfg = getRemoteConfig()
+      if (!cfg) return []
+      const params = new URLSearchParams({ prefix })
+      if (cfg.user) params.set('user', cfg.user)
+      const data = await remoteRequest(`/list?${params.toString()}`)
+      if (Array.isArray(data)) return data
+      if (data && Array.isArray(data.keys)) return data.keys
+      return []
+    } catch (_) {
+      return []
+    }
+  }
+  const storageGet = async (key) => {
+    // 1) remote 優先
+    const remoteVal = await remoteGet(key)
+    if (typeof remoteVal === 'string') return remoteVal
+    // 2) window.storage 次点
+    try {
+      if (window.storage && typeof window.storage.get === 'function') {
+        const result = await window.storage.get(key)
+        if (typeof result === 'string') return result
+        if (result && typeof result === 'object' && 'value' in result) return result.value
+      }
+    } catch (_) {}
+    // 3) localStorage 最後
+    try {
+      return localStorage.getItem(key)
     } catch (error) {
-      console.error('localStorage読み込みエラー:', error);
-      return null;
+      console.error('localStorage読み込みエラー:', error)
+      return null
     }
   };
 
   const storageSet = async (key, value) => {
+    let ok = false
+    // localStorage
     try {
-      // まずwindow.storageを試す
+      localStorage.setItem(key, value)
+      ok = true
+    } catch (_) {}
+    // window.storage
+    try {
       if (window.storage && typeof window.storage.set === 'function') {
-        await window.storage.set(key, value);
-        return true;
+        try {
+          await window.storage.set(key, value)
+          ok = true
+        } catch (_) {
+          await window.storage.set({ key, value })
+          ok = true
+        }
       }
-    } catch (error) {
-      console.log('window.storage使用不可、localStorageにフォールバック');
-    }
-    
-    // フォールバック: localStorage
-    try {
-      localStorage.setItem(key, value);
-      return true;
-    } catch (error) {
-      console.error('localStorage保存エラー:', error);
-      return false;
-    }
+    } catch (_) {}
+    // remote
+    const r = await remoteSet(key, value)
+    if (r) ok = true
+    return ok
   };
 
   const storageDelete = async (key) => {
-    try {
-      if (window.storage && typeof window.storage.delete === 'function') {
-        await window.storage.delete(key);
-        return true;
-      }
-    } catch (error) {
-      console.log('window.storage使用不可、localStorageにフォールバック');
-    }
-    
-    try {
-      localStorage.removeItem(key);
-      return true;
-    } catch (error) {
-      console.error('localStorage削除エラー:', error);
-      return false;
-    }
+    let ok = false
+    try { localStorage.removeItem(key); ok = true } catch (_) {}
+    try { if (window.storage && typeof window.storage.delete === 'function') { await window.storage.delete(key); ok = true } } catch (_) {}
+    const r = await remoteDelete(key); if (r) ok = true
+    return ok
   };
 
   const storageList = async (prefix) => {
+    const merged = new Set()
+    // localStorage
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i)
+        if (k && k.startsWith(prefix)) merged.add(k)
+      }
+    } catch (_) {}
+    // window.storage
     try {
       if (window.storage && typeof window.storage.list === 'function') {
-        return await window.storage.list(prefix);
+        const list = await window.storage.list(prefix)
+        if (Array.isArray(list)) list.forEach(k => { if (typeof k === 'string' && k.startsWith(prefix)) merged.add(k) })
+        else if (list && Array.isArray(list.keys)) list.keys.forEach(k => { if (typeof k === 'string' && k.startsWith(prefix)) merged.add(k) })
       }
-    } catch (error) {
-      console.log('window.storage使用不可、localStorageにフォールバック');
-    }
-    
-    // localStorage版のlist実装
+    } catch (_) {}
+    // remote
     try {
-      const keys = [];
-      for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
-        if (key.startsWith(prefix)) {
-          keys.push(key);
-        }
-      }
-      return { keys };
-    } catch (error) {
-      console.error('localStorageリストエラー:', error);
-      return { keys: [] };
-    }
+      const r = await remoteList(prefix)
+      r.forEach(k => { if (typeof k === 'string' && k.startsWith(prefix)) merged.add(k) })
+    } catch (_) {}
+    return { keys: Array.from(merged) }
   };
 
   // 学習データ読み込み
   useEffect(() => {
     loadLearningData();
+  }, []);
+
+  // ブラウザに永続ストレージをリクエスト（対応ブラウザのみ）
+  useEffect(() => {
+    try {
+      if (navigator.storage && typeof navigator.storage.persist === 'function') {
+        navigator.storage.persist().catch(() => {});
+      }
+    } catch (_) {}
   }, []);
 
   const loadLearningData = async () => {
@@ -766,7 +846,7 @@ ${actualResult}
 
       console.log('📚 学習データ保存完了:', {
         累計学習回数: currentLearning.totalLearnings,
-        保存先: saveSuccess ? 'localStorage' : 'window.storage',
+        保存先: 'localStorage + window.storage (best-effort)',
         最新学習: newInsight.raceName
       });
 
