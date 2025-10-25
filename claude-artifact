@@ -35,16 +35,176 @@ export default function HorseRacingApp() {
     { value: 'professional', label: 'プロ目線', description: '専門家のような詳細分析' }
   ];
 
-  // ストレージ操作のヘルパー関数（フォールバック付き）
+  // ===== Google Drive integration (uses folder ID, falls back if unavailable) =====
+  const DRIVE_FOLDER_ID = '1AIfEDHTQttSTwP6TTG0EIJq4UrTb1G5a'
+  let driveAccessToken = null
+  let driveScriptLoaded = false
+
+  const getGoogleClientId = () => {
+    return (
+      window.GOOGLE_CLIENT_ID ||
+      window.__GOOGLE_CLIENT_ID__ ||
+      window.gapiClientId ||
+      window.gsiClientId ||
+      null
+    )
+  }
+
+  const loadScriptOnce = (src) => {
+    return new Promise((resolve, reject) => {
+      if (document.querySelector(`script[src="${src}"]`)) {
+        resolve()
+        return
+      }
+      const s = document.createElement('script')
+      s.src = src
+      s.async = true
+      s.onload = () => resolve()
+      s.onerror = () => reject(new Error('Failed to load script'))
+      document.head.appendChild(s)
+    })
+  }
+
+  const ensureDriveAccessToken = async () => {
+    try {
+      // persist across renders
+      if (window.__AI_DERBY_DRIVE_TOKEN) {
+        driveAccessToken = window.__AI_DERBY_DRIVE_TOKEN
+        return true
+      }
+      if (driveAccessToken) return true
+      const clientId = getGoogleClientId()
+      if (!clientId) return false
+      if (!driveScriptLoaded && !window.__AI_DERBY_GSI_LOADED) {
+        await loadScriptOnce('https://accounts.google.com/gsi/client')
+        driveScriptLoaded = true
+        window.__AI_DERBY_GSI_LOADED = true
+      }
+      if (!window.google?.accounts?.oauth2) return false
+
+      // Request token each time when missing
+      return await new Promise((resolve, reject) => {
+        const tokenClient = window.google.accounts.oauth2.initTokenClient({
+          client_id: clientId,
+          scope: 'https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.metadata',
+          callback: (resp) => {
+            if (resp?.access_token) {
+              driveAccessToken = resp.access_token
+              window.__AI_DERBY_DRIVE_TOKEN = resp.access_token
+              resolve(true)
+            } else {
+              resolve(false)
+            }
+          }
+        })
+        tokenClient.requestAccessToken({ prompt: 'consent' })
+      })
+    } catch (e) {
+      console.warn('Drive auth failed, falling back')
+      return false
+    }
+  }
+
+  const driveHeaders = () => ({
+    Authorization: `Bearer ${window.__AI_DERBY_DRIVE_TOKEN || driveAccessToken}`
+  })
+
+  const driveFindFileByName = async (name) => {
+    // Find a file by exact name in the target folder
+    const ok = await ensureDriveAccessToken()
+    if (!ok) return null
+    const q = encodeURIComponent(`name = '${name.replace(/'/g, "\\'")}' and '${DRIVE_FOLDER_ID}' in parents and trashed = false`)
+    const url = `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime)&spaces=drive`
+    const res = await fetch(url, { headers: driveHeaders() })
+    if (!res.ok) return null
+    const json = await res.json()
+    return json.files?.[0] || null
+  }
+
+  const driveGet = async (key) => {
+    const file = await driveFindFileByName(key)
+    if (!file) return null
+    const url = `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`
+    const res = await fetch(url, { headers: driveHeaders() })
+    if (!res.ok) return null
+    return await res.text()
+  }
+
+  const driveSet = async (key, value) => {
+    const ok = await ensureDriveAccessToken()
+    if (!ok) return false
+    const existing = await driveFindFileByName(key)
+
+    if (existing) {
+      // Simple media upload to overwrite content
+      const url = `https://www.googleapis.com/upload/drive/v3/files/${existing.id}?uploadType=media`
+      const res = await fetch(url, {
+        method: 'PATCH',
+        headers: { ...driveHeaders(), 'Content-Type': 'application/json; charset=UTF-8' },
+        body: value
+      })
+      return res.ok
+    }
+
+    // Create new file in the folder via multipart/related
+    const boundary = 'lb-' + Math.random().toString(36).slice(2)
+    const delimiter = `\r\n--${boundary}\r\n`
+    const closeDelim = `\r\n--${boundary}--`
+    const metadata = {
+      name: key,
+      parents: [DRIVE_FOLDER_ID]
+    }
+    const multipartBody =
+      delimiter +
+      'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+      JSON.stringify(metadata) +
+      delimiter +
+      'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+      value +
+      closeDelim
+
+    const url = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart'
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { ...driveHeaders(), 'Content-Type': `multipart/related; boundary=${boundary}` },
+      body: multipartBody
+    })
+    return res.ok
+  }
+
+  const driveDelete = async (key) => {
+    const file = await driveFindFileByName(key)
+    if (!file) return true
+    const url = `https://www.googleapis.com/drive/v3/files/${file.id}`
+    const res = await fetch(url, { method: 'DELETE', headers: driveHeaders() })
+    return res.ok
+  }
+
+  const driveList = async (prefix) => {
+    const ok = await ensureDriveAccessToken()
+    if (!ok) return null
+    const q = encodeURIComponent(`name contains '${prefix.replace(/'/g, "\\'")}' and '${DRIVE_FOLDER_ID}' in parents and trashed = false`)
+    const url = `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&pageSize=1000`
+    const res = await fetch(url, { headers: driveHeaders() })
+    if (!res.ok) return null
+    const json = await res.json()
+    const names = (json.files || []).map(f => f.name).filter(n => n.startsWith(prefix))
+    return { keys: names }
+  }
+
+  // ストレージ操作のヘルパー関数（Google Drive優先、フォールバック付き）
   const storageGet = async (key) => {
     try {
-      // まずwindow.storageを試す
+      // まずGoogle Drive
+      const driveValue = await driveGet(key)
+      if (driveValue !== null) return driveValue
+      // 次にwindow.storage
       if (window.storage && typeof window.storage.get === 'function') {
         const result = await window.storage.get(key);
         return result ? result.value : null;
       }
     } catch (error) {
-      console.log('window.storage使用不可、localStorageにフォールバック');
+      console.log('Drive/window.storage使用不可、localStorageにフォールバック');
     }
     
     // フォールバック: localStorage
@@ -58,13 +218,16 @@ export default function HorseRacingApp() {
 
   const storageSet = async (key, value) => {
     try {
-      // まずwindow.storageを試す
+      // まずGoogle Drive
+      const driveOk = await driveSet(key, value)
+      if (driveOk) return true
+      // 次にwindow.storage
       if (window.storage && typeof window.storage.set === 'function') {
         await window.storage.set(key, value);
         return true;
       }
     } catch (error) {
-      console.log('window.storage使用不可、localStorageにフォールバック');
+      console.log('Drive/window.storage使用不可、localStorageにフォールバック');
     }
     
     // フォールバック: localStorage
@@ -79,12 +242,15 @@ export default function HorseRacingApp() {
 
   const storageDelete = async (key) => {
     try {
+      // まずGoogle Drive
+      const driveOk = await driveDelete(key)
+      if (driveOk) return true
       if (window.storage && typeof window.storage.delete === 'function') {
         await window.storage.delete(key);
         return true;
       }
     } catch (error) {
-      console.log('window.storage使用不可、localStorageにフォールバック');
+      console.log('Drive/window.storage使用不可、localStorageにフォールバック');
     }
     
     try {
@@ -98,11 +264,14 @@ export default function HorseRacingApp() {
 
   const storageList = async (prefix) => {
     try {
+      // まずGoogle Drive
+      const driveKeys = await driveList(prefix)
+      if (driveKeys && Array.isArray(driveKeys.keys) && driveKeys.keys.length >= 0) return driveKeys
       if (window.storage && typeof window.storage.list === 'function') {
         return await window.storage.list(prefix);
       }
     } catch (error) {
-      console.log('window.storage使用不可、localStorageにフォールバック');
+      console.log('Drive/window.storage使用不可、localStorageにフォールバック');
     }
     
     // localStorage版のlist実装
