@@ -37,93 +37,102 @@ export default function HorseRacingApp() {
 
   // ストレージ操作のヘルパー関数（フォールバック付き）
   const storageGet = async (key) => {
+    // まず window.storage を優先（Artifacts環境での持続性）
     try {
-      // まずwindow.storageを試す
       if (window.storage && typeof window.storage.get === 'function') {
-        const result = await window.storage.get(key);
-        return result ? result.value : null;
+        const result = await window.storage.get(key)
+        if (typeof result === 'string') return result
+        if (result && typeof result === 'object' && 'value' in result) return result.value
       }
     } catch (error) {
-      console.log('window.storage使用不可、localStorageにフォールバック');
+      console.log('window.storage使用不可、localStorageにフォールバック')
     }
-    
     // フォールバック: localStorage
     try {
-      return localStorage.getItem(key);
+      return localStorage.getItem(key)
     } catch (error) {
-      console.error('localStorage読み込みエラー:', error);
-      return null;
+      console.error('localStorage読み込みエラー:', error)
+      return null
     }
   };
 
   const storageSet = async (key, value) => {
+    let ok = false
+    // localStorage に書き込み
     try {
-      // まずwindow.storageを試す
+      localStorage.setItem(key, value)
+      ok = true
+    } catch (error) {
+      console.log('localStorage保存不可')
+    }
+    // window.storage にも書き込み（利用可能なら）
+    try {
       if (window.storage && typeof window.storage.set === 'function') {
-        await window.storage.set(key, value);
-        return true;
+        // API 仕様差異に備え、両シグネチャを試す
+        try {
+          await window.storage.set(key, value)
+          ok = true
+        } catch (_) {
+          await window.storage.set({ key, value })
+          ok = true
+        }
       }
     } catch (error) {
-      console.log('window.storage使用不可、localStorageにフォールバック');
+      console.log('window.storage保存不可')
     }
-    
-    // フォールバック: localStorage
-    try {
-      localStorage.setItem(key, value);
-      return true;
-    } catch (error) {
-      console.error('localStorage保存エラー:', error);
-      return false;
-    }
+    return ok
   };
 
   const storageDelete = async (key) => {
+    let ok = false
+    try {
+      localStorage.removeItem(key)
+      ok = true
+    } catch (_) {}
     try {
       if (window.storage && typeof window.storage.delete === 'function') {
-        await window.storage.delete(key);
-        return true;
+        await window.storage.delete(key)
+        ok = true
       }
-    } catch (error) {
-      console.log('window.storage使用不可、localStorageにフォールバック');
-    }
-    
-    try {
-      localStorage.removeItem(key);
-      return true;
-    } catch (error) {
-      console.error('localStorage削除エラー:', error);
-      return false;
-    }
+    } catch (_) {}
+    return ok
   };
 
   const storageList = async (prefix) => {
+    const merged = new Set()
+    // localStorage から収集
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i)
+        if (k && k.startsWith(prefix)) merged.add(k)
+      }
+    } catch (_) {}
+    // window.storage から収集
     try {
       if (window.storage && typeof window.storage.list === 'function') {
-        return await window.storage.list(prefix);
-      }
-    } catch (error) {
-      console.log('window.storage使用不可、localStorageにフォールバック');
-    }
-    
-    // localStorage版のlist実装
-    try {
-      const keys = [];
-      for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
-        if (key.startsWith(prefix)) {
-          keys.push(key);
+        const list = await window.storage.list(prefix)
+        if (Array.isArray(list)) {
+          list.forEach(k => { if (typeof k === 'string' && k.startsWith(prefix)) merged.add(k) })
+        } else if (list && Array.isArray(list.keys)) {
+          list.keys.forEach(k => { if (typeof k === 'string' && k.startsWith(prefix)) merged.add(k) })
         }
       }
-      return { keys };
-    } catch (error) {
-      console.error('localStorageリストエラー:', error);
-      return { keys: [] };
-    }
+    } catch (_) {}
+    return { keys: Array.from(merged) }
   };
 
   // 学習データ読み込み
   useEffect(() => {
     loadLearningData();
+  }, []);
+
+  // ブラウザに永続ストレージをリクエスト（対応ブラウザのみ）
+  useEffect(() => {
+    try {
+      if (navigator.storage && typeof navigator.storage.persist === 'function') {
+        navigator.storage.persist().catch(() => {});
+      }
+    } catch (_) {}
   }, []);
 
   const loadLearningData = async () => {
@@ -766,7 +775,7 @@ ${actualResult}
 
       console.log('📚 学習データ保存完了:', {
         累計学習回数: currentLearning.totalLearnings,
-        保存先: saveSuccess ? 'localStorage' : 'window.storage',
+        保存先: 'localStorage + window.storage (best-effort)',
         最新学習: newInsight.raceName
       });
 
