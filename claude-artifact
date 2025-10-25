@@ -36,18 +36,96 @@ export default function HorseRacingApp() {
   ];
 
   // ストレージ操作のヘルパー関数（フォールバック付き）
+  const getRemoteConfig = () => {
+    try {
+      const cfg = window.remoteStorage
+      if (cfg && typeof cfg.baseUrl === 'string' && cfg.baseUrl) return cfg
+    } catch (_) {}
+    return null
+  }
+
+  const remoteRequest = async (path, init = {}) => {
+    const cfg = getRemoteConfig()
+    if (!cfg) throw new Error('remote not configured')
+    const url = cfg.baseUrl.replace(/\/$/, '') + path
+    const headers = { 'Content-Type': 'application/json', ...(cfg.headers || {}) }
+    if (cfg.token) headers['Authorization'] = `Bearer ${cfg.token}`
+    const res = await fetch(url, { ...init, headers })
+    if (!res.ok) throw new Error(`remote ${res.status}`)
+    const ct = res.headers.get('content-type') || ''
+    if (ct.includes('application/json')) return await res.json()
+    return await res.text()
+  }
+
+  const remoteGet = async (key) => {
+    try {
+      const cfg = getRemoteConfig()
+      if (!cfg) return undefined
+      const params = new URLSearchParams({ key })
+      if (cfg.user) params.set('user', cfg.user)
+      const data = await remoteRequest(`/get?${params.toString()}`)
+      if (data && typeof data === 'object' && 'value' in data) return data.value
+      if (typeof data === 'string') return data
+      return undefined
+    } catch (_) {
+      return undefined
+    }
+  }
+
+  const remoteSet = async (key, value) => {
+    try {
+      const cfg = getRemoteConfig()
+      if (!cfg) return false
+      const body = { key, value }
+      if (cfg.user) body.user = cfg.user
+      const data = await remoteRequest('/set', { method: 'POST', body: JSON.stringify(body) })
+      if (data && typeof data === 'object' && data.ok) return true
+      return true
+    } catch (_) {
+      return false
+    }
+  }
+
+  const remoteDelete = async (key) => {
+    try {
+      const cfg = getRemoteConfig()
+      if (!cfg) return false
+      const params = new URLSearchParams({ key })
+      if (cfg.user) params.set('user', cfg.user)
+      await remoteRequest(`/delete?${params.toString()}`, { method: 'DELETE' })
+      return true
+    } catch (_) {
+      return false
+    }
+  }
+
+  const remoteList = async (prefix) => {
+    try {
+      const cfg = getRemoteConfig()
+      if (!cfg) return []
+      const params = new URLSearchParams({ prefix })
+      if (cfg.user) params.set('user', cfg.user)
+      const data = await remoteRequest(`/list?${params.toString()}`)
+      if (Array.isArray(data)) return data
+      if (data && Array.isArray(data.keys)) return data.keys
+      return []
+    } catch (_) {
+      return []
+    }
+  }
   const storageGet = async (key) => {
-    // まず window.storage を優先（Artifacts環境での持続性）
+    // 1) remote 優先
+    const remoteVal = await remoteGet(key)
+    if (typeof remoteVal === 'string') return remoteVal
+    // 2) window.storage 次点
     try {
       if (window.storage && typeof window.storage.get === 'function') {
         const result = await window.storage.get(key)
         if (typeof result === 'string') return result
         if (result && typeof result === 'object' && 'value' in result) return result.value
       }
-    } catch (error) {
-      console.log('window.storage使用不可、localStorageにフォールバック')
-    }
-    // フォールバック: localStorage
+    } catch (_) {}
+    // 3) localStorage 最後
     try {
       return localStorage.getItem(key)
     } catch (error) {
@@ -58,17 +136,14 @@ export default function HorseRacingApp() {
 
   const storageSet = async (key, value) => {
     let ok = false
-    // localStorage に書き込み
+    // localStorage
     try {
       localStorage.setItem(key, value)
       ok = true
-    } catch (error) {
-      console.log('localStorage保存不可')
-    }
-    // window.storage にも書き込み（利用可能なら）
+    } catch (_) {}
+    // window.storage
     try {
       if (window.storage && typeof window.storage.set === 'function') {
-        // API 仕様差異に備え、両シグネチャを試す
         try {
           await window.storage.set(key, value)
           ok = true
@@ -77,46 +152,42 @@ export default function HorseRacingApp() {
           ok = true
         }
       }
-    } catch (error) {
-      console.log('window.storage保存不可')
-    }
+    } catch (_) {}
+    // remote
+    const r = await remoteSet(key, value)
+    if (r) ok = true
     return ok
   };
 
   const storageDelete = async (key) => {
     let ok = false
-    try {
-      localStorage.removeItem(key)
-      ok = true
-    } catch (_) {}
-    try {
-      if (window.storage && typeof window.storage.delete === 'function') {
-        await window.storage.delete(key)
-        ok = true
-      }
-    } catch (_) {}
+    try { localStorage.removeItem(key); ok = true } catch (_) {}
+    try { if (window.storage && typeof window.storage.delete === 'function') { await window.storage.delete(key); ok = true } } catch (_) {}
+    const r = await remoteDelete(key); if (r) ok = true
     return ok
   };
 
   const storageList = async (prefix) => {
     const merged = new Set()
-    // localStorage から収集
+    // localStorage
     try {
       for (let i = 0; i < localStorage.length; i++) {
         const k = localStorage.key(i)
         if (k && k.startsWith(prefix)) merged.add(k)
       }
     } catch (_) {}
-    // window.storage から収集
+    // window.storage
     try {
       if (window.storage && typeof window.storage.list === 'function') {
         const list = await window.storage.list(prefix)
-        if (Array.isArray(list)) {
-          list.forEach(k => { if (typeof k === 'string' && k.startsWith(prefix)) merged.add(k) })
-        } else if (list && Array.isArray(list.keys)) {
-          list.keys.forEach(k => { if (typeof k === 'string' && k.startsWith(prefix)) merged.add(k) })
-        }
+        if (Array.isArray(list)) list.forEach(k => { if (typeof k === 'string' && k.startsWith(prefix)) merged.add(k) })
+        else if (list && Array.isArray(list.keys)) list.keys.forEach(k => { if (typeof k === 'string' && k.startsWith(prefix)) merged.add(k) })
       }
+    } catch (_) {}
+    // remote
+    try {
+      const r = await remoteList(prefix)
+      r.forEach(k => { if (typeof k === 'string' && k.startsWith(prefix)) merged.add(k) })
     } catch (_) {}
     return { keys: Array.from(merged) }
   };
